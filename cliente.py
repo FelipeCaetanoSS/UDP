@@ -33,7 +33,7 @@ def upload():
     # Em vez de ler tudo para a memória de uma vez, vamos ler em chunks e gerenciar a janela.
     
     # O cliente também precisa de uma variável para o socket timeout para o loop de retransmissão
-    cliente.settimeout(TIMEOUT)
+    cliente.settimeout(TIMEOUT) 
 
     with open(caminho, "rb") as f:
         # Inicialização para o protocolo de janela deslizante
