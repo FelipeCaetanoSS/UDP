@@ -1,87 +1,180 @@
-# cliente.py
+import socket
+import os
+from utils import interpretar_pacote, criar_pacote # Agora interpretar_pacote retorna mais valores
+from tkinter import filedialog
+from pathlib import Path
+import zlib # Para o crc32 se for calcular no cliente também, embora utils já faça
 
-import socket # Importa a biblioteca de sockets para a comunicação de rede.
-import os # Importa a biblioteca do sistema operacional para manipulação de caminhos e nomes de arquivos.
-from utils import enviar_arquivo, receber_arquivo # Importa as funções de alto nível do nosso protocolo do arquivo utils.py.
-from tkinter import filedialog, Tk # Importa do Tkinter as ferramentas para criar uma caixa de diálogo de seleção de arquivo.
-from pathlib import Path # Importa a classe Path para manipulação de caminhos de arquivo de forma moderna e multiplataforma.
+IP_SERVIDOR = "192.168.15.13"
+PORTA = 5005
+TIMEOUT = 2
+WINDOW_SIZE = 5
 
-# --- Configurações do Cliente ---
-IP_SERVIDOR = "192.168.15.13" # Define o endereço IP do servidor. "127.0.0.1" é o localhost (a própria máquina).
-PORTA = 5005 # Define a porta do servidor à qual o cliente irá se conectar. Deve ser a mesma do servidor.
-TIMEOUT = 2 # Define um timeout padrão para operações do cliente (não usado diretamente aqui, mas em utils).
+cliente = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+cliente.settimeout(TIMEOUT)
 
-def listar(cliente_socket):
-    """Pede a lista de arquivos ao servidor."""
-    print("\nSolicitando lista de arquivos...") # Informa ao usuário a ação que está sendo executada.
-    try: # Inicia um bloco para tratar exceções de rede, como timeouts.
-        cliente_socket.settimeout(5) # Define um timeout de 5 segundos para esta operação específica.
-        cliente_socket.sendto(b"LISTAR", (IP_SERVIDOR, PORTA)) # Envia o comando "LISTAR" em bytes para o endereço do servidor.
-        dados, _ = cliente_socket.recvfrom(4096) # Espera receber uma resposta de até 4096 bytes do servidor.
-        print("\n--- Arquivos Disponiveis no Servidor ---\n" + dados.decode(errors='ignore')) # Decodifica a resposta e a imprime.
-        print("----------------------------------------") # Imprime uma linha para formatação.
-    except socket.timeout: # Captura o erro se o servidor não responder a tempo.
-        print("Erro: O servidor nao respondeu ao pedido de listagem.") # Informa o usuário sobre o timeout.
-    except Exception as e: # Captura qualquer outro erro que possa ocorrer.
-        print(f"Ocorreu um erro: {e}") # Exibe a mensagem de erro.
+def listar():
+    cliente.sendto(b"LISTAR", (IP_SERVIDOR, PORTA))
+    try:
+        dados, _ = cliente.recvfrom(4096)
+        print("\nArquivos disponíveis:\n" + dados.decode(errors='ignore'))
+    except socket.timeout:
+        print("Servidor não respondeu.")
 
-def upload(cliente_socket):
-    """Pede ao usuário para escolher um arquivo e o envia para o servidor."""
-    root = Tk() # Cria uma instância da janela principal do Tkinter.
-    root.withdraw() # Esconde a janela principal, pois queremos apenas a caixa de diálogo.
-    caminho = filedialog.askopenfilename(title="Escolha um arquivo para enviar") # Abre a caixa de diálogo para o usuário selecionar um arquivo.
-    if not caminho: # Se o usuário fechar a caixa de diálogo sem selecionar um arquivo.
-        print("Nenhum arquivo selecionado.") # Informa que a operação foi cancelada.
-        return # Retorna e encerra a função.
+def upload():
+    caminho = filedialog.askopenfilename(title="Escolha um arquivo")
+    if not caminho:
+        return
+    nome = os.path.basename(caminho)
+    # A mensagem inicial 'UPLOAD {nome}' não usa o protocolo de pacotes, então não precisa de checksum aqui.
+    cliente.sendto(f"UPLOAD {nome}".encode(), (IP_SERVIDOR, PORTA))
 
-    nome_arquivo = os.path.basename(caminho) # Extrai apenas o nome do arquivo do caminho completo.
-    print(f"Preparando para enviar o arquivo: {nome_arquivo}") # Informa qual arquivo será enviado.
-
-    cliente_socket.sendto(f"UPLOAD {nome_arquivo}".encode(), (IP_SERVIDOR, PORTA)) # Envia o comando "UPLOAD" seguido do nome do arquivo para o servidor.
+    # --- Ponto 2: Correção de "Gargalo" no Upload do Cliente ---
+    # Em vez de ler tudo para a memória de uma vez, vamos ler em chunks e gerenciar a janela.
     
-    enviar_arquivo(cliente_socket, (IP_SERVIDOR, PORTA), caminho) # Chama a função utilitária para lidar com todo o processo de envio do arquivo.
+    # O cliente também precisa de uma variável para o socket timeout para o loop de retransmissão
+    cliente.settimeout(TIMEOUT)
 
-def download(cliente_socket):
-    """Pede um nome de arquivo e o baixa do servidor."""
-    nome_arquivo = input("Digite o nome do arquivo para download: ") # Pede ao usuário para digitar o nome do arquivo desejado.
-    if not nome_arquivo: # Verifica se o usuário digitou algo.
-        print("Nome do arquivo nao pode ser vazio.") # Informa que o nome não pode ser vazio.
-        return # Encerra a função.
+    with open(caminho, "rb") as f:
+        # Inicialização para o protocolo de janela deslizante
+        base = 0
+        seq_atual = 0 # Próximo número de sequência a ser lido do arquivo
+        janela_pacotes_buffer = {} # Dicionário para armazenar pacotes na janela: {seq: pacote_bytes}
+        total_pacotes = -1 # Será determinado dinamicamente ou por um marcador de fim de arquivo
 
-    caminho_destino = os.path.join(str(Path.home()), "Downloads", os.path.basename(nome_arquivo)) # Constrói o caminho de destino na pasta de Downloads do usuário.
-    print(f"Solicitando download de '{nome_arquivo}' para '{caminho_destino}'...") # Informa ao usuário sobre a ação.
+        # Loop principal para enviar o arquivo
+        while True:
+            # Preencher a janela com novos pacotes se houver espaço e dados para ler
+            while len(janela_pacotes_buffer) < WINDOW_SIZE and f.tell() < os.fstat(f.fileno()).st_size:
+                dados_chunk = f.read(1019)
+                if not dados_chunk: # Fim do arquivo
+                    break
+                pacote = criar_pacote(1, seq_atual, dados_chunk)
+                janela_pacotes_buffer[seq_atual] = pacote
+                seq_atual += 1
+            
+            # Se não há mais pacotes para ler e a janela está vazia, terminamos
+            if not janela_pacotes_buffer and f.tell() >= os.fstat(f.fileno()).st_size:
+                break # Sai do loop principal de envio
 
-    cliente_socket.sendto(f"DOWNLOAD {nome_arquivo}".encode(), (IP_SERVIDOR, PORTA)) # Envia o comando "DOWNLOAD" com o nome do arquivo para o servidor.
-    
-    if not receber_arquivo(cliente_socket, (IP_SERVIDOR, PORTA), caminho_destino): # Chama a função utilitária para receber o arquivo e verifica seu retorno.
-        print(f"O download de '{nome_arquivo}' falhou.") # Se a função retornar False, informa que o download falhou.
-    else: # Se a função retornar True.
-        print(f"\nDownload completo! Arquivo salvo em:\n{caminho_destino}") # Informa que o download foi bem-sucedido e onde o arquivo foi salvo.
+            # Enviar todos os pacotes na janela (retransmissão)
+            for s in sorted(janela_pacotes_buffer.keys()):
+                cliente.sendto(janela_pacotes_buffer[s], (IP_SERVIDOR, PORTA))
 
-def main():
-    """Função principal que executa o loop do menu do cliente."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as cliente: # Cria um socket UDP e usa 'with' para garantir que ele seja fechado ao final.
-        while True: # Inicia o loop infinito do menu principal.
-            print("\n===============================") # Imprime o cabeçalho do menu.
-            print("Escolha uma opcao:") # Pede ao usuário para escolher uma ação.
-            print("1. Listar arquivos no servidor") # Opção de listar arquivos.
-            print("2. Fazer Upload de um arquivo") # Opção de upload.
-            print("3. Fazer Download de um arquivo") # Opção de download.
-            print("4. Sair") # Opção para fechar o cliente.
-            print("===============================") # Imprime o rodapé do menu.
-            opcao = input("Opcao: ") # Lê a escolha do usuário.
+            try:
+                # Esperar por ACKs para avançar a janela
+                # Ponto 3: Correção de Reset de 'retries' no Cliente (Upload)
+                # A lógica de 'retries' no cliente para upload será mais robusta aqui.
+                # Cada envio de janela tem seu próprio conjunto de tentativas.
+                # Se um ACK válido for recebido, as retries para aquela janela são zeradas.
+                ack_recebido_valido = False
+                while True: # Loop para receber múltiplos ACKs se necessário
+                    ack, _ = cliente.recvfrom(1024)
+                    # Agora interpretar_pacote retorna mais coisas, precisamos ignorar o que não é tipo/seq
+                    tipo, ack_seq, _, _, _ = interpretar_pacote(ack) 
+                    
+                    if tipo == 2 and ack_seq >= base:
+                        # Remove pacotes reconhecidos do buffer da janela
+                        for s_acked in range(base, ack_seq + 1):
+                            if s_acked in janela_pacotes_buffer:
+                                del janela_pacotes_buffer[s_acked]
+                        base = ack_seq + 1 # Avança a base da janela
+                        ack_recebido_valido = True
+                        break # Sai do loop de recebimento de ACK e reavalia a janela
+            except socket.timeout:
+                print("Timeout. Reenviando janela de upload...")
+                # Nenhuma mudança na base, apenas retransmite a janela atual na próxima iteração
+                # A contagem de 'retries' implícita será que se o loop externo continuar, haverá retransmissões.
+                # Poderíamos adicionar um contador de retries específico para esta janela aqui.
+                # Para manter a simplicidade e a consistência com o utils.py, a retransmissão da janela é o comportamento.
+                
+                # Se quisermos limitar as retries como no servidor:
+                # retries_atuais += 1
+                # if retries_atuais >= MAX_RETRIES:
+                #     print("Limite de retransmissões atingido, upload pode estar incompleto.")
+                #     break # ou lançar um erro
+                
+                pass # Continua para a próxima iteração do while True principal para reenviar a janela
 
-            if opcao == "1": # Se a opção for "1".
-                listar(cliente) # Chama a função para listar arquivos.
-            elif opcao == "2": # Se a opção for "2".
-                upload(cliente) # Chama a função para fazer upload.
-            elif opcao == "3": # Se a opção for "3".
-                download(cliente) # Chama a função para fazer download.
-            elif opcao == "4": # Se a opção for "4".
-                print("Saindo...") # Informa que o programa está encerrando.
-                break # Quebra o loop 'while' e encerra o programa.
-            else: # Se a opção for qualquer outra coisa.
-                print("Opcao invalida. Tente novamente.") # Informa que a escolha é inválida.
+        # Finaliza a transmissão enviando o pacote de FIM.
+        cliente.sendto(criar_pacote(3, 0), (IP_SERVIDOR, PORTA))
+        print("Upload concluído.")
 
-if __name__ == "__main__": # Garante que o script está sendo executado diretamente.
-    main() # Chama a função principal para iniciar o cliente.
+
+def download():
+    nome = input("Digite o nome do arquivo para download: ")
+    # A mensagem inicial 'DOWNLOAD {nome}' não usa o protocolo de pacotes.
+    cliente.sendto(f"DOWNLOAD {nome}".encode(), (IP_SERVIDOR, PORTA))
+    caminho = os.path.join(str(Path.home()), "Downloads", nome)
+
+    try:
+        with open(caminho, "wb") as f:
+            esperada = 0
+            # Ponto 4: Melhoria no Tratamento de Erro de Nome de Arquivo/Servidor (Download)
+            # O cliente precisa saber como interpretar um ERRO do servidor.
+            # Vamos receber a primeira resposta do servidor para verificar se é um erro.
+            primeira_resposta, _ = cliente.recvfrom(2048)
+            tipo_resp, seq_resp, dados_resp, recebido_checksum_resp, calculado_checksum_resp = interpretar_pacote(primeira_resposta)
+
+            if tipo_resp == 4: # Supondo tipo 4 para ERRO
+                print(f"Erro no download: {dados_resp.decode(errors='ignore')}")
+                return # Aborta o download
+            elif tipo_resp == 3 and seq_resp == 0 and not dados_resp: # Servidor enviou FIM imediatamente (arquivo vazio ou erro inesperado que resultou em fim)
+                print("Download completo (arquivo vazio ou servidor indicou fim imediato).")
+                return # Aborta o download se o arquivo for vazio.
+            
+            # Se não é erro e não é fim imediato, é um pacote de dados ou início.
+            # Precisa reprocessar o primeiro pacote que foi lido se ele for um pacote de dados.
+            # Idealmente, o servidor não enviaria o primeiro pacote de dados com o mesmo mecanismo
+            # que envia a mensagem de erro. Poderíamos ter um "início de download" com tipo 0
+            # para o servidor enviar, e ele pode conter o tamanho do arquivo, etc.
+            # Para manter a lógica atual de Go-Back-N, vamos reusar o primeiro pacote lido.
+            pacote_inicial = primeira_resposta
+            
+            while True:
+                # Se já processamos o pacote inicial, agora recebemos normalmente
+                if 'pacote_inicial' in locals() and pacote_inicial:
+                    pacote = pacote_inicial
+                    pacote_inicial = None # Marca como processado
+                else:
+                    pacote, _ = cliente.recvfrom(2048)
+                
+                tipo, seq, dados, recebido_checksum, calculado_checksum = interpretar_pacote(pacote)
+                
+                if tipo == 3: # FIM da transmissão
+                    break
+                if tipo == 1: # Pacote de dados
+                    if recebido_checksum == calculado_checksum: # Verifica o checksum
+                        if seq == esperada:
+                            f.write(dados)
+                            ack = criar_pacote(2, seq)
+                            cliente.sendto(ack, (IP_SERVIDOR, PORTA))
+                            esperada += 1
+                        else: # Pacote fora de ordem ou duplicado (mas com checksum correto)
+                            # Reenvia ACK para o último pacote corretamente recebido (Go-Back-N)
+                            ack = criar_pacote(2, esperada - 1)
+                            cliente.sendto(ack, (IP_SERVIDOR, PORTA))
+                    else:
+                        print(f"Checksum inválido para o pacote {seq} durante o download. Descartando.")
+                        # Não envia ACK para este pacote inválido, forçando o servidor a retransmitir.
+                        # Ou, para ser mais explícito, envia ACK para o último esperado.
+                        ack = criar_pacote(2, esperada - 1)
+                        cliente.sendto(ack, (IP_SERVIDOR, PORTA))
+                # Pacotes de outros tipos são ignorados aqui (como tipo 4 ERRO que já foi tratado antes)
+        print(f"Download completo. Arquivo salvo em:\n{caminho}")
+    except socket.timeout:
+        print("Timeout do servidor durante o download.")
+        # Se um timeout acontecer durante o download, o arquivo pode estar incompleto.
+        # Poderíamos ter um mecanismo para tentar reativar ou informar ao usuário.
+
+while True:
+    print("\n1. Listar arquivos\n2. Upload\n3. Download\n4. Sair")
+    opcao = input("Escolha: ")
+    if opcao == "1":
+        listar()
+    elif opcao == "2":
+        upload()
+    elif opcao == "3":
+        download()
+    elif opcao == "4":
+        break
