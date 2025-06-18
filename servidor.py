@@ -1,70 +1,67 @@
 import socket
 import threading
 import os
-from utils import receber_arquivo, enviar_janela, criar_pacote # Importar criar_pacote
+from utils import criar_pacote, interpretar_pacote, enviar_janela
 
-IP = "192.168.15.13"
+IP = "192.168.91.238"  # IP da sua máquina
 PORTA = 5005
 PASTA_ARQUIVOS = "arquivos_servidor"
-
 os.makedirs(PASTA_ARQUIVOS, exist_ok=True)
 
 def tratar_cliente(dados, endereco, sock):
-    opcao = dados.decode(errors='ignore')
-    if opcao == "LISTAR":
-        arquivos = os.listdir(PASTA_ARQUIVOS)
-        resposta = "\n".join(arquivos).encode()
-        sock.sendto(resposta, endereco)
+    try:
+        opcao = dados.decode()
+        if opcao == "LISTAR":
+            arquivos = os.listdir(PASTA_ARQUIVOS)
+            resposta = "\n".join(arquivos).encode()
+            sock.sendto(resposta, endereco)
 
-    elif opcao.startswith("UPLOAD"):
-        partes = opcao.split()
-        nome = "arquivo_recebido.bin"
-        if len(partes) >= 2:
-            nome = "_".join(partes[1:])
-        receber_arquivo(sock, PASTA_ARQUIVOS, nome, endereco)
-        print(f"Arquivo '{nome}' salvo com sucesso.")
+        elif opcao.startswith("UPLOAD"):
+            partes = opcao.split()
+            nome = "_".join(partes[1:]) or "arquivo_recebido.bin"
+            caminho = os.path.join(PASTA_ARQUIVOS, nome)
+            with open(caminho, "wb") as f:
+                esperada = 0
+                while True:
+                    pacote, _ = sock.recvfrom(2048)
+                    tipo, seq, dados = interpretar_pacote(pacote)
 
-    elif opcao.startswith("DOWNLOAD"):
-        partes = opcao.split(maxsplit=1)
-        if len(partes) < 2:
-            # Ponto 4: Melhoria no Tratamento de Erro de Nome de Arquivo (Servidor)
-            # Envia um pacote de ERRO (tipo 4) com uma mensagem.
-            erro_msg = "Nome do arquivo não especificado."
-            pacote_erro = criar_pacote(4, 0, erro_msg.encode())
-            sock.sendto(pacote_erro, endereco)
-            return
-        _, nome = partes
-        caminho = os.path.join(PASTA_ARQUIVOS, nome)
-        if not os.path.exists(caminho):
-            # Ponto 4: Melhoria no Tratamento de Erro de Nome de Arquivo (Servidor)
-            # Envia um pacote de ERRO (tipo 4) com uma mensagem.
-            erro_msg = f"Arquivo '{nome}' não encontrado no servidor."
-            pacote_erro = criar_pacote(4, 0, erro_msg.encode())
-            sock.sendto(pacote_erro, endereco)
-            return
+                    if tipo == 3:
+                        break
+                    elif tipo == 1 and seq == esperada:
+                        f.write(dados)
+                        ack = criar_pacote(2, seq)
+                        sock.sendto(ack, endereco)
+                        esperada += 1
+                    else:
+                        ack = criar_pacote(2, esperada - 1)
+                        sock.sendto(ack, endereco)
+            print(f"✔ Arquivo '{nome}' salvo em '{PASTA_ARQUIVOS}'.")
 
-        with open(caminho, "rb") as f:
-            conteudo_arquivo = f.read()
-            # Ponto 4: Melhoria no Tratamento de MAX_RETRIES do Servidor (Download)
-            # A função enviar_janela agora precisa lidar com o caso de falha.
-            # Poderíamos ter um retorno booleano ou levantar uma exceção.
-            # Por enquanto, a lógica interna do enviar_janela já envia um FIM.
-            # A melhoria aqui é que o cliente agora sabe lidar com o pacote de ERRO.
-            enviado_com_sucesso = enviar_janela(sock, conteudo_arquivo, endereco)
-            if enviado_com_sucesso: # A `enviar_janela` precisa retornar algo
-                print(f"Arquivo '{nome}' enviado.")
-            else:
-                print(f"Falha ao enviar o arquivo '{nome}' após múltiplas tentativas.")
-                # O servidor pode enviar um pacote de ERRO aqui também, se desejar.
-                erro_msg = f"Falha na transmissão do arquivo '{nome}'."
-                pacote_erro = criar_pacote(4, 0, erro_msg.encode())
-                sock.sendto(pacote_erro, endereco)
+        elif opcao.startswith("DOWNLOAD"):
+            partes = opcao.split(maxsplit=1)
+            if len(partes) < 2:
+                sock.sendto(b"ERRO", endereco)
+                return
+            nome = partes[1]
+            caminho = os.path.join(PASTA_ARQUIVOS, nome)
+            if not os.path.exists(caminho):
+                sock.sendto(b"ERRO", endereco)
+                return
 
+            with open(caminho, "rb") as f:
+                dados = f.read()
+                enviar_janela(sock, dados, endereco)
+            print(f"✔ Arquivo '{nome}' enviado para {endereco}.")
 
+    except Exception as e:
+        print(f"Erro no cliente {endereco}: {e}")
+
+# Inicializa o servidor
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((IP, PORTA))
 print(f"Servidor escutando em {IP}:{PORTA}")
 
 while True:
-    dados, endereco = sock.recvfrom(2048) # Aumentar buffer para pacotes maiores
+    dados, endereco = sock.recvfrom(2048)
     threading.Thread(target=tratar_cliente, args=(dados, endereco, sock)).start()
